@@ -101,6 +101,24 @@ def get_report_result(report, filters):
 	return res
 
 
+def get_report_pagination() -> frappe._dict | None:
+	return frappe.flags.get("report_pagination")
+
+
+def can_paginate_in_query(report, user) -> bool:
+	if cint(report.add_total_row):
+		return False
+
+	if frappe.permissions.get_user_permissions(user):
+		return False
+
+	if not report.ref_doctype:
+		return True
+
+	meta = frappe.get_meta(report.ref_doctype)
+	return not get_role_permissions(meta, user).get("if_owner", {}).get("report")
+
+
 @frappe.read_only()
 def generate_report_result(
 	report,
@@ -109,6 +127,8 @@ def generate_report_result(
 	custom_columns=None,
 	is_tree=False,
 	parent_field=None,
+	start=0,
+	page_length=None,
 ):
 	user = user or frappe.session.user
 	filters = filters or []
@@ -116,9 +136,20 @@ def generate_report_result(
 	if filters and isinstance(filters, str):
 		filters = json.loads(filters)
 
-	res = get_report_result(report, filters) or []
+	start = max(cint(start), 0)
+	page_length = 0 if sbool(is_tree) else cint(page_length)
+	in_query = page_length > 0 and can_paginate_in_query(report, user)
+	if in_query:
+		frappe.flags.report_pagination = frappe._dict(
+			report=report.name, start=start, page_length=page_length
+		)
 
-	columns, result, message, chart, report_summary, skip_total_row = ljust_list(res, 6)
+	try:
+		res = get_report_result(report, filters) or []
+	finally:
+		frappe.flags.report_pagination = None
+
+	columns, result, message, chart, report_summary, skip_total_row, query_total = ljust_list(res, 7)
 	columns = [get_column_as_dict(col) for col in (columns or [])]
 	report_column_names = [col["fieldname"] for col in columns]
 	# convert to list of dicts
@@ -150,13 +181,22 @@ def generate_report_result(
 
 	has_total_row = cint(report.add_total_row) and result and not skip_total_row
 
+	paged_in_query = in_query and query_total is not None
+	total_count = cint(query_total) if paged_in_query else len(result or [])
+
 	if has_total_row:
 		result = add_total_row(result, columns, is_tree=is_tree, parent_field=parent_field)
+
+	if page_length > 0 and not paged_in_query:
+		result = paginate_result(result, start, page_length, total_count, has_total_row)
 
 	if isinstance(filters, dict) and filters.get("translate_data"):
 		result = translate_report_data(result, has_total_row)
 
 	return_dict = {
+		"total_count": total_count,
+		"start": start if page_length > 0 else 0,
+		"page_length": page_length or None,
 		"result": result,
 		"columns": columns,
 		"message": message,
@@ -184,6 +224,14 @@ def generate_report_result(
 			)
 
 	return return_dict
+
+
+def paginate_result(result, start, page_length, total_count, has_total_row):
+	page = result[:total_count][start : start + page_length]
+	if has_total_row:
+		page.append(result[-1])
+
+	return page
 
 
 def normalize_result(result, columns):
@@ -258,6 +306,8 @@ def run(
 	parent_field: str | None = None,
 	are_default_filters: bool = True,
 	js_filters: str | list | None = None,
+	start: int = 0,
+	page_length: int | None = None,
 ) -> dict:
 	return _run(
 		report_name=report_name,
@@ -268,6 +318,8 @@ def run(
 		parent_field=parent_field,
 		are_default_filters=are_default_filters,
 		js_filters=js_filters,
+		start=start,
+		page_length=page_length,
 	)
 
 
@@ -282,6 +334,8 @@ def _run(
 	parent_field: str | None = None,
 	are_default_filters: bool = True,
 	js_filters: str | list | None = None,
+	start: int = 0,
+	page_length: int | None = None,
 ) -> dict:
 	if not user:
 		user = frappe.session.user
@@ -321,7 +375,9 @@ def _run(
 				dn = ""
 			result = get_prepared_report_result(report, filters, dn, user)
 		else:
-			result = generate_report_result(report, filters, user, custom_columns, is_tree, parent_field)
+			result = generate_report_result(
+				report, filters, user, custom_columns, is_tree, parent_field, start, page_length
+			)
 			add_data_to_monitor(report=report.reference_report or report.name)
 	except Exception:
 		frappe.log_error("Report execution failed for: {}".format(report_name))
