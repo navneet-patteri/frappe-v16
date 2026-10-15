@@ -3,6 +3,7 @@
 
 import datetime
 import json
+from unittest.mock import patch
 
 import frappe
 from frappe.desk.link_title import get_report_link_titles
@@ -11,6 +12,7 @@ from frappe.desk.query_report import (
 	build_xlsx_data,
 	export_query,
 	format_fields,
+	generate_report_result,
 	run,
 )
 from frappe.tests import IntegrationTestCase
@@ -730,6 +732,118 @@ data = columns, result
 		from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 
 		make_property_setter(doctype, None, "show_title_field_in_link", "1", "Check", for_doctype=True)
+
+	def test_generate_report_result_pagination(self):
+		columns = [{"fieldname": "idx", "label": "Idx", "fieldtype": "Int"}]
+		rows = [{"idx": i} for i in range(1, 11)]
+		report = frappe._dict(
+			name="Pagination Report",
+			ref_doctype=None,
+			add_total_row=1,
+			custom_columns=None,
+			snapshot_report=0,
+		)
+
+		def result(**kwargs):
+			with (
+				patch(
+					"frappe.desk.query_report.get_report_result",
+					return_value=[columns, [dict(r) for r in rows]],
+				),
+				patch("frappe.desk.query_report.get_filtered_data", side_effect=lambda dt, c, d, u: d),
+			):
+				return generate_report_result(report, **kwargs)
+
+		unpaged = result()
+		self.assertEqual(len(unpaged["result"]), 11)
+		self.assertEqual(unpaged["total_count"], 10)
+		self.assertIsNone(unpaged["page_length"])
+
+		first = result(start=0, page_length=4)
+		self.assertEqual([r["idx"] for r in first["result"][:-1]], [1, 2, 3, 4])
+		self.assertEqual(first["result"][-1], [55])
+		self.assertEqual((first["total_count"], first["start"], first["page_length"]), (10, 0, 4))
+
+		last = result(start=8, page_length=4)
+		self.assertEqual([r["idx"] for r in last["result"][:-1]], [9, 10])
+		self.assertEqual(last["result"][-1], [55])
+
+		self.assertEqual(result(start=20, page_length=4)["result"], [[55]])
+
+		tree = result(start=0, page_length=4, is_tree=True)
+		self.assertEqual(len(tree["result"]), 11)
+		self.assertIsNone(tree["page_length"])
+
+	def _make_sql_report(self, query, **kwargs):
+		name = "Pagination SQL Report"
+		frappe.delete_doc_if_exists("Report", name, force=1)
+		return frappe.get_doc(
+			{
+				"doctype": "Report",
+				"report_name": name,
+				"ref_doctype": "ToDo",
+				"report_type": "Query Report",
+				"is_standard": "No",
+				"query": query,
+				**kwargs,
+			}
+		).insert()
+
+	def test_query_report_pagination_in_query(self):
+		for i in range(7):
+			frappe.get_doc({"doctype": "ToDo", "description": f"page-test-{i}"}).insert()
+		query = "select name, description from tabToDo where description like 'page-test-%%' order by name"
+		self._make_sql_report(query)
+
+		full = run("Pagination SQL Report")["result"]
+		self.assertEqual(len(full), 7)
+
+		with patch("frappe.desk.query_report.paginate_result") as post_slice:
+			page = run("Pagination SQL Report", start=3, page_length=3)
+			post_slice.assert_not_called()
+
+		self.assertEqual(page["result"], full[3:6])
+		self.assertEqual(page["total_count"], 7)
+		self.assertEqual(run("Pagination SQL Report", start=6, page_length=3)["result"], full[6:])
+		self.assertIsNone(frappe.flags.report_pagination)
+
+	def test_query_report_pagination_falls_back(self):
+		for i in range(4):
+			frappe.get_doc({"doctype": "ToDo", "description": f"page-test-{i}"}).insert()
+		base = "select name, description from tabToDo where description like 'page-test-%%' order by name"
+
+		for query, kwargs, page_size in (
+			(base + " limit 100", {}, 2),
+			(base + " -- trailing comment", {}, 2),
+			(base, {"add_total_row": 1}, 3),
+			("select name, name from tabToDo where description like 'page-test-%%' order by name", {}, 2),
+		):
+			self._make_sql_report(query, **kwargs)
+			with patch(
+				"frappe.desk.query_report.paginate_result", wraps=frappe.desk.query_report.paginate_result
+			) as post_slice:
+				page = run("Pagination SQL Report", start=1, page_length=2)
+				post_slice.assert_called_once()
+			self.assertEqual(page["total_count"], 4, query)
+			self.assertEqual(len(page["result"]), page_size, query)
+
+	def test_query_report_pagination_flag_is_scoped_to_the_report(self):
+		report = self._make_sql_report("select name from tabToDo")
+		frappe.flags.report_pagination = frappe._dict(report="Another Report", start=0, page_length=1)
+		try:
+			self.assertIsNone(report.execute_paginated_query({}))
+		finally:
+			frappe.flags.report_pagination = None
+
+	def test_can_paginate_in_query(self):
+		from frappe.desk.query_report import can_paginate_in_query
+
+		report = frappe._dict(ref_doctype="ToDo", add_total_row=0)
+		self.assertTrue(can_paginate_in_query(report, "Administrator"))
+		self.assertFalse(can_paginate_in_query(frappe._dict(report, add_total_row=1), "Administrator"))
+
+		with patch("frappe.permissions.get_user_permissions", return_value={"ToDo": [{"doc": "x"}]}):
+			self.assertFalse(can_paginate_in_query(report, "Administrator"))
 
 
 def create_mock_data():

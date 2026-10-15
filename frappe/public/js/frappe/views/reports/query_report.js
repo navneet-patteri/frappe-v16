@@ -494,6 +494,62 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			.then(() => frappe.model.with_doctype(this.report_doc?.ref_doctype));
 	}
 
+	get_pagination_args() {
+		const page_length = this.report_doc?.prepared_report
+			? 0
+			: cint(this.report_doc?.page_length);
+		return page_length ? { start: cint(this.start), page_length } : {};
+	}
+
+	is_paginated() {
+		return cint(this.raw_data?.page_length) > 0;
+	}
+
+	get_column_total(values, cell, type) {
+		if (this.server_total_row) {
+			return this.server_total_row[cell.column.id] ?? null;
+		}
+		return frappe.utils.report_column_total(values, cell, type);
+	}
+
+	render_pager(data) {
+		this.$pager?.remove();
+		this.$pager = null;
+
+		const page_length = cint(data?.page_length);
+		const total = cint(data?.total_count);
+		if (!page_length || total <= page_length) return;
+
+		const start = cint(data.start);
+		const page = Math.floor(start / page_length) + 1;
+		const pages = Math.ceil(total / page_length);
+		const to = Math.min(start + page_length, total);
+
+		const disabled = (condition) => (condition ? "disabled" : "");
+
+		this.$pager =
+			$(`<div class="report-pager d-flex justify-content-between align-items-center mt-3">
+			<span class="text-muted">${__("{0} - {1} of {2}", [start + 1, to, total])}</span>
+			<div class="btn-group">
+				<button class="btn btn-xs btn-default" data-action="prev" ${disabled(page <= 1)}>
+					${__("Previous")}
+				</button>
+				<span class="btn btn-xs btn-default disabled">
+					${__("Page {0} of {1}", [page, pages])}
+				</span>
+				<button class="btn btn-xs btn-default" data-action="next" ${disabled(page >= pages)}>
+					${__("Next")}
+				</button>
+			</div>
+		</div>`).insertAfter(this.$report);
+
+		this.$pager.on("click", "[data-action]", (e) => {
+			const step = $(e.currentTarget).data("action") === "next" ? 1 : -1;
+			this.start = Math.max(0, start + step * page_length);
+			this.refresh();
+		});
+	}
+
 	get_report_settings() {
 		return new Promise((resolve, reject) => {
 			if (frappe.query_reports[this.report_name]) {
@@ -794,6 +850,12 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			})
 			.every((res) => res === true);
 
+		const page_key = JSON.stringify([this.report_name, filters]);
+		if (have_filters_changed || page_key !== this.page_key) {
+			this.page_key = page_key;
+			this.start = 0;
+		}
+
 		this.show_loading_screen();
 
 		// only one refresh at a time
@@ -823,6 +885,7 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 					parent_field: this.report_settings.parent_field,
 					are_default_filters: are_default_filters,
 					js_filters: js_filters,
+					...this.get_pagination_args(),
 				},
 				callback: resolve,
 				always: () => this.page.btn_secondary.prop("disabled", false),
@@ -830,6 +893,10 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		})
 			.then((r) => {
 				let data = r.message;
+				if (this.start && data.page_length && this.start >= data.total_count) {
+					this.start = 0;
+					return this.refresh();
+				}
 				this.hide_status();
 				clearInterval(this.interval);
 				clearInterval(this.stale_report_interval);
@@ -934,12 +1001,14 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 						}
 					}
 					this.render_datatable();
+					this.render_pager(data);
 					this.add_chart_buttons_to_toolbar(true);
 					this.add_card_button_to_toolbar();
 					this.toggle_print_buttons(true);
 					this.$report.show();
 				} else {
 					this.data = [];
+					this.render_pager(null);
 					this.toggle_nothing_to_show(true);
 					this.add_chart_buttons_to_toolbar(false);
 					this.toggle_print_buttons(false);
@@ -1177,9 +1246,11 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			return;
 		}
 
+		this.server_total_row = null;
 		if (this.raw_data.add_total_row && !this.report_settings.tree) {
 			data = data.slice();
-			data.splice(-1, 1);
+			const [total_row] = data.splice(-1, 1);
+			if (this.is_paginated()) this.server_total_row = total_row;
 		}
 
 		this.$report.show();
@@ -1203,7 +1274,7 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 				showTotalRow: this.raw_data.add_total_row && !this.report_settings.tree,
 				direction: frappe.utils.is_rtl() ? "rtl" : "ltr",
 				hooks: {
-					columnTotal: frappe.utils.report_column_total,
+					columnTotal: (values, cell, type) => this.get_column_total(values, cell, type),
 				},
 			};
 
@@ -1903,7 +1974,8 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 				const totalRows = this.data.length - (this.raw_data.add_total_row ? 1 : 0);
 				const isIdentityOrder =
 					visible_idx.length === totalRows && visible_idx.every((idx, i) => idx === i);
-				const ignore_visible_idx = !has_datatable || isIdentityOrder;
+				const ignore_visible_idx =
+					!has_datatable || isIdentityOrder || this.is_paginated();
 				visible_idx = ignore_visible_idx ? [] : visible_idx;
 
 				const args = {

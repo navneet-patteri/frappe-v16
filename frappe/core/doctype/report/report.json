@@ -19,6 +19,7 @@
   "add_total_row",
   "disabled",
   "prepared_report",
+  "page_length",
   "snapshot_report",
   "disable_prepared_report_automation",
   "add_translate_data",
@@ -158,6 +159,15 @@
    "label": "Prepared Report"
   },
   {
+   "default": "0",
+   "depends_on": "eval:!doc.prepared_report",
+   "description": "Rows per page in the report view. 0 shows all rows. Charts, column filters, sorting, Print and PDF cover only the current page; the total row and Export cover every row.",
+   "fieldname": "page_length",
+   "fieldtype": "Int",
+   "label": "Page Length",
+   "non_negative": 1
+  },
+  {
    "depends_on": "eval:doc.report_type===\"Script Report\" && doc.is_standard===\"No\"",
    "description": "Filters will be accessible via <code>filters</code>. <br><br>Send output as <code>result = [result]</code>, or for old style <code>data = [columns], [result]</code>",
    "fieldname": "report_script",
@@ -245,7 +255,7 @@
  "idx": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-22 00:05:00.000000",
+ "modified": "2026-10-14 18:10:00.000000",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "Report",

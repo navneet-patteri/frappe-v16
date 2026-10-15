@@ -2,12 +2,14 @@
 # License: MIT. See LICENSE
 import datetime
 import json
+import re
 import threading
 
 import frappe
 from frappe import _, scrub
 from frappe.core.doctype.custom_role.custom_role import get_custom_allowed_roles
 from frappe.core.doctype.page.page import delete_custom_role
+from frappe.database.database import savepoint
 from frappe.desk.query_report import _run
 from frappe.desk.reportview import append_totals_row
 from frappe.model.document import Document
@@ -44,6 +46,7 @@ class Report(Document):
 		json: DF.Code | None
 		letter_head: DF.Link | None
 		module: DF.Link | None
+		page_length: DF.Int
 		prepared_report: DF.Check
 		query: DF.Code | None
 		ref_doctype: DF.Link
@@ -182,10 +185,41 @@ class Report(Document):
 
 		check_safe_sql_query(self.query)
 
+		if paged := self.execute_paginated_query(filters):
+			return paged
+
 		result = [list(t) for t in frappe.db.sql(self.query, filters)]
 		columns = self.get_columns() or [cstr(c[0]) for c in frappe.db.get_description()]
 
 		return [columns, result]
+
+	def execute_paginated_query(self, filters):
+		page = frappe.flags.get("report_pagination")
+		if not page or page.report != self.name:
+			return None
+
+		query = (self.query or "").strip().rstrip(";").rstrip()
+
+		if (filters and not isinstance(filters, dict)) or re.search(r"--|#|/\*", query):
+			return None
+		if re.search(r"\blimit\b[^()]*$", query, re.IGNORECASE):
+			return None
+
+		total = None
+		with savepoint(catch=Exception):
+			total = frappe.db.sql("select count(*) from (" + query + ") as _report_rows", filters)[0][0]
+		if total is None:
+			return None
+
+		values = {
+			**(filters or {}),
+			"_report_page_length": cint(page.page_length),
+			"_report_start": cint(page.start),
+		}
+		rows = frappe.db.sql(query + " limit %(_report_page_length)s offset %(_report_start)s", values)
+		columns = self.get_columns() or [cstr(c[0]) for c in frappe.db.get_description()]
+
+		return [columns, [list(t) for t in rows], None, None, None, None, total]
 
 	def execute_script_report(self, filters):
 		# save the timestamp to automatically set to prepared
